@@ -141,16 +141,6 @@ func ProcessToolCalls(calls []ToolCall) []string {
 	return outputs
 }
 
-// IsToolAllowed mengecek apakah nama tool ada di dalam daftar allowedTools yang diberikan.
-func IsToolAllowed(tools []ToolDefinition, name string) bool {
-	for _, t := range tools {
-		if strings.EqualFold(t.Function.Name, name) {
-			return true
-		}
-	}
-	return false
-}
-
 // ParseToolCalls mengekstrak tool calls dari output teks jika model menghasilkan format <tool_call>...</tool_call>.
 func ParseToolCalls(text string) []ToolCall {
 	var calls []ToolCall
