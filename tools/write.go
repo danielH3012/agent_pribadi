@@ -34,6 +34,16 @@ func WriteFile(filePath string, content string) (*WriteOutput, error) {
 		return nil, fmt.Errorf("content cannot be empty")
 	}
 
+	// 4. Ask user permission
+	preview := content
+	if len(preview) > 500 {
+		preview = preview[:500] + "\n... (truncated)"
+	}
+	desc := fmt.Sprintf("Target File: %s\nTotal Size: %d bytes\n--- Content Preview ---\n%s", filePath, len(content), preview)
+	if err := AskPermission("write", desc); err != nil {
+		return nil, err
+	}
+
 	tmp, err := os.CreateTemp(dir, ".tmp-"+filepath.Base(filePath)+"-*")
 	if err != nil {
 		return nil, err

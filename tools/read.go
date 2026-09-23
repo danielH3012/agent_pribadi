@@ -15,6 +15,15 @@ type ReadOutput struct {
 }
 
 func ReadFile(path string, limit ...int) (*ReadOutput, error) {
+	// Ask user permission
+	desc := fmt.Sprintf("Target File: %s", path)
+	if len(limit) > 0 && limit[0] > 0 {
+		desc = fmt.Sprintf("Target File: %s (limit: %d lines)", path, limit[0])
+	}
+	if err := AskPermission("read", desc); err != nil {
+		return nil, err
+	}
+
 	// 1. Validate path
 	info, err := os.Stat(path)
 	if err != nil {

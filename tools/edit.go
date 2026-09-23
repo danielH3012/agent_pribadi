@@ -8,6 +8,7 @@ import (
 )
 
 type EditResult struct {
+	Path        string `json:"path,omitempty"`
 	OldContent  string `json:"old_content"`
 	NewContent  string `json:"new_content"`
 	Status      string `json:"status"`
@@ -22,7 +23,19 @@ func EditFile(filePath string, newContent string, oldContent string) (*EditResul
 		return nil, fmt.Errorf("new_content cannot be empty")
 	}
 
-	readResult, err := ReadFile(filePath) // Get formatted dengan line numbers
+	// Ask user permission
+	desc := fmt.Sprintf("Target File: %s\n--- Old Content (%d chars) ---\n%s\n--- New Content (%d chars) ---\n%s",
+		filePath, len(oldContent), oldContent, len(newContent), newContent)
+	if err := AskPermission("edit", desc); err != nil {
+		return nil, err
+	}
+
+	var readResult *ReadOutput
+	err := SuppressPermission(func() error {
+		var rerr error
+		readResult, rerr = ReadFile(filePath)
+		return rerr
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -105,7 +118,7 @@ func EditFile(filePath string, newContent string, oldContent string) (*EditResul
 			os.Remove(filePath) // Clean up corrupted file
 			return nil, fmt.Errorf("data integrity check failed after write")
 		}
-		return &EditResult{Status: "success", OldContent: oldContent, NewContent: newContent, Occurrences: occurrences}, nil
+		return &EditResult{Path: filePath, Status: "success", OldContent: oldContent, NewContent: newContent, Occurrences: occurrences}, nil
 	} else {
 		return nil, fmt.Errorf("old content not found in file")
 	}
