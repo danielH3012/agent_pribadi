@@ -1,47 +1,59 @@
 package tools
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"os"
 	"strings"
+	"sync"
 )
 
 var (
-	// AutoApprove can be enabled for automated tests or environments where stdin is not interactive.
+	// AutoApprove menyetujui semua aksi tanpa prompt (untuk test / lingkungan non-interaktif).
 	AutoApprove = false
 
-	// CustomPermissionReader can be overridden during tests.
+	// CustomPermissionReader menggantikan terminal sebagai sumber jawaban (untuk test).
 	CustomPermissionReader io.Reader = nil
 
-	// PermissionHandler allows hooking a custom approval callback.
-	// If set and returns (true, nil), action is approved.
-	// If returns (false, err), action is rejected.
+	// PermissionHandler adalah hook persetujuan kustom. Kalau di-set, ia yang menentukan
+	// dan prompt terminal dilewati. (true, nil) = setuju, (false, nil) = tolak, (_, err) = gagal.
 	PermissionHandler func(toolName, actionDescription string) (bool, error)
 
-	bypassPermissionDepth int
+	// Serialisasi prompt supaya tool call paralel tidak saling menimpa di terminal.
+	permMu sync.Mutex
 )
 
-// SuppressPermission executes a function while temporarily bypassing permission checks.
-// Useful for composite tools (e.g. EditFile or MultiEdit) that internally call ReadFile.
-func SuppressPermission(fn func() error) error {
-	bypassPermissionDepth++
-	defer func() {
-		bypassPermissionDepth--
-	}()
-	return fn()
+// readLine membaca satu baris byte demi byte, tanpa buffering berlebih,
+// sehingga satu reader (mis. strings.Reader di test) bisa dipakai untuk beberapa prompt.
+func readLine(r io.Reader) (string, error) {
+	var sb strings.Builder
+	buf := make([]byte, 1)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			if buf[0] == '\n' {
+				return sb.String(), nil
+			}
+			sb.WriteByte(buf[0])
+		}
+		if err != nil {
+			if err == io.EOF && sb.Len() > 0 {
+				return sb.String(), nil
+			}
+			return sb.String(), err
+		}
+	}
 }
 
-// AskPermission displays the intended action of a tool and prompts the user for approval.
-// Returns nil if approved, or an error if denied.
+// AskPermission menampilkan aksi yang akan dijalankan dan meminta persetujuan.
+// Mengembalikan nil kalau disetujui, error kalau ditolak.
+//
+// PENTING: stdout/stdin dipakai oleh MCP (JSON-RPC), jadi prompt tidak boleh lewat keduanya.
+// Prompt ditampilkan dan dibaca lewat /dev/tty; log lain ke stderr.
 func AskPermission(toolName string, actionDescription string) error {
-	// If currently running in a suppressed/nested internal context, bypass prompt
-	if bypassPermissionDepth > 0 {
-		return nil
-	}
+	permMu.Lock()
+	defer permMu.Unlock()
 
-	// 1. If custom hook is defined, prioritize it
 	if PermissionHandler != nil {
 		allowed, err := PermissionHandler(toolName, actionDescription)
 		if err != nil {
@@ -53,45 +65,47 @@ func AskPermission(toolName string, actionDescription string) error {
 		return fmt.Errorf("permission denied by custom handler for tool '%s'", toolName)
 	}
 
-	// 2. Display formatted action details to user
-	fmt.Println("\n==================================================")
-	fmt.Printf("[PERMISSION REQUEST] Tool: %s\n", strings.ToUpper(toolName))
-	fmt.Println("Action Details:")
-	fmt.Println(actionDescription)
-	fmt.Println("--------------------------------------------------")
+	var (
+		in  io.Reader
+		out io.Writer = os.Stderr
+	)
 
-	// 3. Check AutoApprove
-	if AutoApprove {
-		fmt.Println("[AUTO-APPROVED] Proceeding without prompt.")
-		fmt.Println("==================================================")
+	switch {
+	case AutoApprove:
+		fmt.Fprintf(out, "[AUTO-APPROVED] %s\n%s\n", strings.ToUpper(toolName), actionDescription)
 		return nil
+	case CustomPermissionReader != nil:
+		in = CustomPermissionReader
+	default:
+		tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+		if err != nil {
+			// Fail closed: tanpa terminal, jangan pernah menyetujui diam-diam.
+			return fmt.Errorf("permission denied: no terminal available to confirm tool '%s' "+
+				"(set AutoApprove or PermissionHandler): %w", toolName, err)
+		}
+		defer tty.Close()
+		in, out = tty, tty
 	}
 
-	// 4. Prompt user from Stdin or CustomPermissionReader
-	fmt.Printf("Do you allow %s to proceed? [y/N]: ", toolName)
+	fmt.Fprintln(out, "\n==================================================")
+	fmt.Fprintf(out, "[PERMISSION REQUEST] Tool: %s\n", strings.ToUpper(toolName))
+	fmt.Fprintln(out, "Action Details:")
+	fmt.Fprintln(out, actionDescription)
+	fmt.Fprintln(out, "--------------------------------------------------")
+	fmt.Fprintf(out, "Do you allow %s to proceed? [y/N]: ", toolName)
 
-	var reader *bufio.Reader
-	if CustomPermissionReader != nil {
-		reader = bufio.NewReader(CustomPermissionReader)
-	} else {
-		reader = bufio.NewReader(os.Stdin)
-	}
-
-	input, err := reader.ReadString('\n')
-	if err != nil && len(input) == 0 {
-		fmt.Printf("\n[DENIED] Failed to read confirmation: %v\n", err)
-		fmt.Println("==================================================")
+	input, err := readLine(in)
+	if err != nil && input == "" {
+		fmt.Fprintf(out, "\n[DENIED] Failed to read confirmation: %v\n", err)
 		return fmt.Errorf("permission denied: unable to read confirmation for tool '%s': %w", toolName, err)
 	}
 
-	cleaned := strings.ToLower(strings.TrimSpace(input))
-	if cleaned == "y" || cleaned == "yes" {
-		fmt.Printf("[APPROVED] Proceeding with %s...\n", toolName)
-		fmt.Println("==================================================")
+	switch strings.ToLower(strings.TrimSpace(input)) {
+	case "y", "yes":
+		fmt.Fprintf(out, "[APPROVED] Proceeding with %s...\n", toolName)
 		return nil
 	}
 
-	fmt.Printf("[DENIED] Action cancelled by user for %s.\n", toolName)
-	fmt.Println("==================================================")
+	fmt.Fprintf(out, "[DENIED] Action cancelled by user for %s.\n", toolName)
 	return fmt.Errorf("permission denied by user for tool '%s'", toolName)
 }
