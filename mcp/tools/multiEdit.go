@@ -1,267 +1,198 @@
 package tools
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/mark3labs/mcp-go/mcp"
 )
 
-type MultiEditResult struct {
-	Success         bool         `json:"success"`
-	Message         string       `json:"message"`
-	Applied         int          `json:"applied"`
-	Operations      []EditResult `json:"operations"`
-	RolledBack      bool         `json:"rolled_back"`
-	RollbackMessage string       `json:"rollback_message,omitempty"`
+type EditOp struct {
+	FilePath   string `json:"file_path"`
+	OldContent string `json:"old_content"`
+	NewContent string `json:"new_content"`
+	ReplaceAll bool   `json:"replace_all"`
 }
 
-func MultiEdit(operations []EditResult) (*MultiEditResult, error) {
-	result := &MultiEditResult{
-		Operations: make([]EditResult, 0),
+type MultiEditOpResult struct {
+	Index       int    `json:"index"` // 1-based
+	Path        string `json:"path"`
+	Occurrences int    `json:"occurrences"`
+	Replaced    int    `json:"replaced"`
+}
+
+type MultiEditResult struct {
+	Success         bool                `json:"success"`
+	Message         string              `json:"message"`
+	Applied         int                 `json:"applied"`
+	FilesChanged    int                 `json:"files_changed"`
+	Operations      []MultiEditOpResult `json:"operations,omitempty"`
+	RolledBack      bool                `json:"rolled_back"`
+	RollbackMessage string              `json:"rollback_message,omitempty"`
+}
+
+type fileEdit struct {
+	realPath string
+	perm     os.FileMode
+	original string
+	updated  string
+}
+
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "..."
+}
+
+// MultiEdit menerapkan beberapa edit. Edit pada file yang sama diterapkan
+// berurutan (edit ke-2 melihat hasil edit ke-1) dan file ditulis sekali.
+// Semua divalidasi di memori dulu; kalau penulisan gagal, file yang sudah
+// tertulis dikembalikan ke isi aslinya (best-effort).
+func MultiEdit(ops []EditOp) (*MultiEditResult, error) {
+	if len(ops) == 0 {
+		return nil, fmt.Errorf("no edits provided")
 	}
 
-	if len(operations) == 0 {
-		return nil, fmt.Errorf("no operations provided")
+	// ===== PHASE 1: validasi + hitung hasil di memori =====
+	files := map[string]*fileEdit{}
+	var order []string
+	opResults := make([]MultiEditOpResult, 0, len(ops))
+
+	for i, op := range ops {
+		n := i + 1
+		if op.FilePath == "" {
+			return nil, fmt.Errorf("edit %d: file_path cannot be empty", n)
+		}
+		if op.OldContent == "" {
+			return nil, fmt.Errorf("edit %d: old_content cannot be empty", n)
+		}
+		if op.OldContent == op.NewContent {
+			return nil, fmt.Errorf("edit %d: old_content and new_content are identical", n)
+		}
+
+		realPath, err := filepath.EvalSymlinks(op.FilePath)
+		if err != nil {
+			return nil, fmt.Errorf("edit %d (%s): %w", n, op.FilePath, err)
+		}
+
+		fe, ok := files[realPath]
+		if !ok {
+			info, err := os.Stat(realPath)
+			if err != nil {
+				return nil, fmt.Errorf("edit %d (%s): %w", n, op.FilePath, err)
+			}
+			if info.IsDir() {
+				return nil, fmt.Errorf("edit %d: %s is a directory", n, op.FilePath)
+			}
+			data, err := os.ReadFile(realPath)
+			if err != nil {
+				return nil, fmt.Errorf("edit %d (%s): %w", n, op.FilePath, err)
+			}
+			fe = &fileEdit{
+				realPath: realPath,
+				perm:     info.Mode().Perm(),
+				original: string(data),
+				updated:  string(data),
+			}
+			files[realPath] = fe
+			order = append(order, realPath)
+		}
+
+		occ := strings.Count(fe.updated, op.OldContent)
+		switch {
+		case occ == 0:
+			return nil, fmt.Errorf("edit %d (%s): old content not found (edits earlier in this batch are already applied)", n, op.FilePath)
+		case occ > 1 && !op.ReplaceAll:
+			return nil, fmt.Errorf("edit %d (%s): old content found %d times; add more context or set replace_all", n, op.FilePath, occ)
+		}
+
+		count, replaced := 1, 1
+		if op.ReplaceAll {
+			count, replaced = -1, occ
+		}
+		fe.updated = strings.Replace(fe.updated, op.OldContent, op.NewContent, count)
+
+		opResults = append(opResults, MultiEditOpResult{
+			Index: n, Path: op.FilePath, Occurrences: occ, Replaced: replaced,
+		})
 	}
 
-	// Ask user permission
-	var opDetails strings.Builder
-	opDetails.WriteString(fmt.Sprintf("Total operations: %d\n", len(operations)))
-	for i, op := range operations {
-		oldPreview := op.OldContent
-		if len(oldPreview) > 40 {
-			oldPreview = oldPreview[:40] + "..."
-		}
-		newPreview := op.NewContent
-		if len(newPreview) > 40 {
-			newPreview = newPreview[:40] + "..."
-		}
-		opDetails.WriteString(fmt.Sprintf("  [%d] File: %s\n      Replace: %q\n      With:    %q\n",
-			i+1, op.Path, oldPreview, newPreview))
+	// ===== PHASE 2: minta permission (setelah semua valid) =====
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%d edit(s) across %d file(s)\n", len(ops), len(order))
+	for i, op := range ops {
+		fmt.Fprintf(&sb, "  [%d] %s\n      - %q\n      + %q\n",
+			i+1, op.FilePath, truncateRunes(op.OldContent, 60), truncateRunes(op.NewContent, 60))
 	}
-	if err := AskPermission("multi_edit", opDetails.String()); err != nil {
+	if err := AskPermission("multi_edit", sb.String()); err != nil {
 		return nil, err
 	}
 
-	// ========== PHASE 1: VALIDATION ==========
-	backups := make(map[string]string)
-	validOps := make([]EditResult, 0)
+	// ===== PHASE 3: tulis per file, rollback kalau gagal =====
+	var written []*fileEdit
+	for _, p := range order {
+		fe := files[p]
+		if fe.updated == fe.original { // mis. A->B lalu B->A
+			continue
+		}
+		if err := writeFileAtomic(fe.realPath, []byte(fe.updated), fe.perm); err != nil {
+			execErr := fmt.Errorf("write %s: %w", fe.realPath, err)
+			res := &MultiEditResult{Message: execErr.Error()}
 
-	for i, op := range operations {
-		if op.Path == "" {
-			return nil, fmt.Errorf("op %d: path cannot be empty", i)
-		}
-		if op.OldContent == "" {
-			return nil, fmt.Errorf("op %d: old_content cannot be empty", i)
-		}
-		if op.NewContent == "" {
-			return nil, fmt.Errorf("op %d: new_content cannot be empty", i)
-		}
-
-		// --- Get raw content dari ReadFile (strip line number prefix) ---
-		var readResult *ReadOutput
-		var rerr error
-		_ = SuppressPermission(func() error {
-			readResult, rerr = ReadFile(op.Path)
-			return rerr
-		})
-		if rerr != nil {
-			return nil, fmt.Errorf("op %d (%s): %w", i, op.Path, rerr)
-		}
-
-		var rawContent string
-		for _, line := range readResult.Lines {
-			idx := strings.Index(line, "] ")
-			if idx == -1 {
-				return nil, fmt.Errorf("op %d (%s): unexpected line format: %s", i, op.Path, line)
+			// File yang gagal tidak berubah (rename atomic), cukup restore yang sudah tertulis.
+			var rbErrs []string
+			for _, w := range written {
+				if rerr := writeFileAtomic(w.realPath, []byte(w.original), w.perm); rerr != nil {
+					rbErrs = append(rbErrs, fmt.Sprintf("%s: %v", w.realPath, rerr))
+				}
 			}
-			rawContent += line[idx+2:] + "\n"
+			res.RolledBack = len(written) > 0 && len(rbErrs) == 0
+			switch {
+			case len(rbErrs) > 0:
+				res.RollbackMessage = fmt.Sprintf("rollback failed for %d file(s): %s", len(rbErrs), strings.Join(rbErrs, "; "))
+			case len(written) > 0:
+				res.RollbackMessage = fmt.Sprintf("%d file(s) restored to original", len(written))
+			default:
+				res.RollbackMessage = "no files had been modified"
+			}
+			return res, execErr
 		}
-		// --- end get raw content ---
-
-		if !strings.Contains(rawContent, op.OldContent) {
-			return nil, fmt.Errorf("op %d (%s): pattern not found", i, op.Path)
-		}
-
-		occurrences := strings.Count(rawContent, op.OldContent)
-
-		newContent := strings.Replace(rawContent, op.OldContent, op.NewContent, 1)
-		if newContent == rawContent {
-			return nil, fmt.Errorf("op %d (%s): content unchanged after replacement", i, op.Path)
-		}
-
-		backups[op.Path] = rawContent
-
-		validOps = append(validOps, EditResult{
-			Path:        op.Path,
-			OldContent:  op.OldContent,
-			NewContent:  op.NewContent,
-			Occurrences: occurrences,
-		})
+		written = append(written, fe)
 	}
 
-	// ========== PHASE 2: EXECUTION ==========
-	appliedPaths := []string{}
-	var executionErr error
+	return &MultiEditResult{
+		Success:      true,
+		Message:      fmt.Sprintf("applied %d edit(s) to %d file(s)", len(ops), len(written)),
+		Applied:      len(ops),
+		FilesChanged: len(written),
+		Operations:   opResults,
+	}, nil
+}
 
-	for i, op := range validOps {
-		originalContent := backups[op.Path]
-		newContent := strings.Replace(originalContent, op.OldContent, op.NewContent, 1)
-
-		// --- Atomic write (sama persis konsep EditFile) ---
-		dir := filepath.Dir(op.Path)
-
-		tmp, err := os.CreateTemp(dir, ".tmp-"+filepath.Base(op.Path)+"-*")
-		if err != nil {
-			executionErr = fmt.Errorf("op %d (%s): %w", i, op.Path, err)
-			break
-		}
-		tmpName := tmp.Name()
-
-		contentBytes := []byte(newContent)
-		bytesWritten, werr := tmp.Write(contentBytes)
-		if werr != nil {
-			tmp.Close()
-			os.Remove(tmpName)
-			executionErr = fmt.Errorf("op %d (%s): %w", i, op.Path, werr)
-			break
-		}
-
-		if bytesWritten != len(contentBytes) {
-			tmp.Close()
-			os.Remove(tmpName)
-			executionErr = fmt.Errorf("op %d (%s): partial write: %d/%d bytes", i, op.Path, bytesWritten, len(contentBytes))
-			break
-		}
-
-		if err := tmp.Sync(); err != nil {
-			tmp.Close()
-			os.Remove(tmpName)
-			executionErr = fmt.Errorf("op %d (%s): %w", i, op.Path, err)
-			break
-		}
-
-		if err := tmp.Chmod(0644); err != nil {
-			tmp.Close()
-			os.Remove(tmpName)
-			executionErr = fmt.Errorf("op %d (%s): %w", i, op.Path, err)
-			break
-		}
-
-		if err := tmp.Close(); err != nil {
-			os.Remove(tmpName)
-			executionErr = fmt.Errorf("op %d (%s): %w", i, op.Path, err)
-			break
-		}
-
-		if err := os.Rename(tmpName, op.Path); err != nil {
-			os.Remove(tmpName)
-			executionErr = fmt.Errorf("op %d (%s): %w", i, op.Path, err)
-			break
-		}
-
-		verifyData, err := os.ReadFile(op.Path)
-		if err != nil {
-			executionErr = fmt.Errorf("op %d (%s): %w", i, op.Path, err)
-			break
-		}
-		if string(verifyData) != newContent {
-			os.Remove(op.Path)
-			executionErr = fmt.Errorf("op %d (%s): data integrity check failed after write", i, op.Path)
-			break
-		}
-		// --- end atomic write ---
-
-		appliedPaths = append(appliedPaths, op.Path)
-
-		result.Operations = append(result.Operations, EditResult{
-			Path:        op.Path,
-			OldContent:  op.OldContent,
-			NewContent:  op.NewContent,
-			Status:      "success",
-			Occurrences: op.Occurrences,
-		})
+// MultiEditHandler adapts MultiEdit to server.ToolHandlerFunc.
+func MultiEditHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	var args struct {
+		Edits []EditOp `json:"edits"`
+	}
+	if err := req.BindArguments(&args); err != nil {
+		return mcp.NewToolResultError("invalid arguments: " + err.Error()), nil
 	}
 
-	// ========== PHASE 3: ROLLBACK (jika ada error) ==========
-	if executionErr != nil {
-		result.Success = false
-		result.Message = executionErr.Error()
-		result.RolledBack = true
-
-		var rollbackErrs []error
-
-		for _, path := range appliedPaths {
-			originalContent := backups[path]
-
-			// --- Atomic write untuk restore (konsep sama) ---
-			dir := filepath.Dir(path)
-
-			tmp, err := os.CreateTemp(dir, ".tmp-"+filepath.Base(path)+"-*")
-			if err != nil {
-				rollbackErrs = append(rollbackErrs, fmt.Errorf("rollback %s: %w", path, err))
-				continue
-			}
-			tmpName := tmp.Name()
-
-			contentBytes := []byte(originalContent)
-			bytesWritten, werr := tmp.Write(contentBytes)
-			if werr != nil {
-				tmp.Close()
-				os.Remove(tmpName)
-				rollbackErrs = append(rollbackErrs, fmt.Errorf("rollback %s: %w", path, werr))
-				continue
-			}
-
-			if bytesWritten != len(contentBytes) {
-				tmp.Close()
-				os.Remove(tmpName)
-				rollbackErrs = append(rollbackErrs, fmt.Errorf("rollback %s: partial write", path))
-				continue
-			}
-
-			if err := tmp.Sync(); err != nil {
-				tmp.Close()
-				os.Remove(tmpName)
-				rollbackErrs = append(rollbackErrs, fmt.Errorf("rollback %s: %w", path, err))
-				continue
-			}
-
-			if err := tmp.Chmod(0644); err != nil {
-				tmp.Close()
-				os.Remove(tmpName)
-				rollbackErrs = append(rollbackErrs, fmt.Errorf("rollback %s: %w", path, err))
-				continue
-			}
-
-			if err := tmp.Close(); err != nil {
-				os.Remove(tmpName)
-				rollbackErrs = append(rollbackErrs, fmt.Errorf("rollback %s: %w", path, err))
-				continue
-			}
-
-			if err := os.Rename(tmpName, path); err != nil {
-				os.Remove(tmpName)
-				rollbackErrs = append(rollbackErrs, fmt.Errorf("rollback %s: %w", path, err))
-				continue
-			}
-			// --- end atomic write restore ---
+	res, err := MultiEdit(args.Edits)
+	if err != nil {
+		if res != nil { // gagal di tengah penulisan: kirim detail rollback
+			b, _ := json.Marshal(res)
+			return mcp.NewToolResultError(string(b)), nil
 		}
-
-		if len(rollbackErrs) > 0 {
-			result.RollbackMessage = fmt.Sprintf("rollback had %d errors: %v", len(rollbackErrs), rollbackErrs)
-			return result, executionErr
-		}
-
-		result.RollbackMessage = fmt.Sprintf("All %d changes rolled back", len(appliedPaths))
-		return result, executionErr
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	// ========== SUCCESS ==========
-	result.Success = true
-	result.Applied = len(appliedPaths)
-	result.Message = fmt.Sprintf("Successfully applied %d edits atomically", result.Applied)
-
-	return result, nil
+	b, _ := json.Marshal(res)
+	return mcp.NewToolResultText(string(b)), nil
 }

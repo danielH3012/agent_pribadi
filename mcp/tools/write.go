@@ -1,105 +1,91 @@
 package tools
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+
+	"github.com/mark3labs/mcp-go/mcp"
 )
 
+const maxWriteSize = 10 << 20 // 10 MB
+
 type WriteOutput struct {
-	Path    string `json:"path"`
-	Message string `json:"message"`
-	Size    int64  `json:"size"`
+	Path           string `json:"path"`
+	Message        string `json:"message"`
+	Size           int64  `json:"size"`
+	CreatedParents bool   `json:"created_parents,omitempty"`
 }
 
-func WriteFile(filePath string, content string) (*WriteOutput, error) {
-	// 1. Check file sudah ada
-	_, err := os.Stat(filePath)
-	if err == nil {
-		return nil, fmt.Errorf("file already exists: %s", filePath)
+// WriteFile membuat file BARU. Gagal kalau file sudah ada (pakai edit untuk mengubahnya).
+func WriteFile(filePath, content string) (*WriteOutput, error) {
+	if strings.TrimSpace(filePath) == "" {
+		return nil, fmt.Errorf("file_path cannot be empty")
 	}
-	if !os.IsNotExist(err) {
+	if len(content) > maxWriteSize {
+		return nil, fmt.Errorf("content too large (%d bytes, max %d)", len(content), maxWriteSize)
+	}
+
+	// Lstat: dangling symlink juga dianggap "sudah ada"
+	if _, err := os.Lstat(filePath); err == nil {
+		return nil, fmt.Errorf("file already exists: %s (use edit to modify it)", filePath)
+	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
 
-	// ✅ 2. Create parent directories jika belum ada
 	dir := filepath.Dir(filePath)
-	if dir != "." && dir != "" {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return nil, err
-		}
-	}
-	// 3. Validate content
-	if content == "" {
-		return nil, fmt.Errorf("content cannot be empty")
+	needMkdir := false
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		needMkdir = true
 	}
 
-	// 4. Ask user permission
-	preview := content
-	if len(preview) > 500 {
-		preview = preview[:500] + "\n... (truncated)"
+	// Permission SEBELUM ada perubahan apa pun di disk
+	desc := fmt.Sprintf("Target File: %s\nTotal Size: %d bytes", filePath, len(content))
+	if needMkdir {
+		desc += fmt.Sprintf("\nWill create parent directory: %s", dir)
 	}
-	desc := fmt.Sprintf("Target File: %s\nTotal Size: %d bytes\n--- Content Preview ---\n%s", filePath, len(content), preview)
+	desc += "\n--- Content Preview ---\n" + truncateRunes(content, 500)
 	if err := AskPermission("write", desc); err != nil {
 		return nil, err
 	}
 
-	tmp, err := os.CreateTemp(dir, ".tmp-"+filepath.Base(filePath)+"-*")
-	if err != nil {
-		return nil, err
-	}
-	tmpName := tmp.Name()
-
-	// Clean up on any failure
-	defer func() {
-		if tmpName != "" {
-			_ = tmp.Close()
-			_ = os.Remove(tmpName)
+	if needMkdir {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, err
 		}
-	}()
+	}
 
-	// ✅ 5. Write data + VERIFY bytes written
-	contentBytes := []byte(content)
-	bytesWritten, err := tmp.Write(contentBytes)
+	if err := writeFileAtomic(filePath, []byte(content), 0o644); err != nil {
+		return nil, err
+	}
+
+	return &WriteOutput{
+		Path:           filePath,
+		Message:        "success",
+		Size:           int64(len(content)),
+		CreatedParents: needMkdir,
+	}, nil
+}
+
+// WriteHandler adapts WriteFile to server.ToolHandlerFunc.
+func WriteHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	path, err := req.RequireString("file_path")
 	if err != nil {
-		return nil, err
+		return mcp.NewToolResultError(err.Error()), nil
 	}
-
-	// ✅ Verify semua bytes tertulis
-	if bytesWritten != len(contentBytes) {
-		return nil, fmt.Errorf("partial write: %d/%d bytes", bytesWritten, len(contentBytes))
-	}
-
-	// 3. fsync to ensure data hits disk before rename
-	if err := tmp.Sync(); err != nil {
-		return nil, err
-	}
-
-	// 3. Set permissions (0644 = rw-r--r--)
-	if err := tmp.Chmod(0644); err != nil {
-		return nil, err
-	}
-
-	if err := tmp.Close(); err != nil {
-		return nil, err
-	}
-
-	// 5. Atomic rename
-	if err := os.Rename(tmpName, filePath); err != nil {
-		return nil, err
-	}
-	tmpName = "" // prevent deferred cleanup
-
-	// ✅ VERIFY: Read back dan compare (integrity check)
-	verifyData, err := os.ReadFile(filePath)
+	content, err := req.RequireString("content") // string kosong tetap valid
 	if err != nil {
-		return nil, err
-	}
-	if string(verifyData) != content {
-		// Data tidak match - ini serious error
-		os.Remove(filePath) // Clean up corrupted file
-		return nil, fmt.Errorf("data integrity check failed after write")
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	return &WriteOutput{Path: filePath, Message: "success", Size: int64(len(content))}, nil
+	res, err := WriteFile(path, content)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	b, _ := json.Marshal(res)
+	return mcp.NewToolResultText(string(b)), nil
 }

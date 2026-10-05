@@ -1,125 +1,142 @@
 package tools
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/mark3labs/mcp-go/mcp"
 )
 
 type EditResult struct {
-	Path        string `json:"path,omitempty"`
+	Path        string `json:"path"`
+	Status      string `json:"status"`
+	Occurrences int    `json:"occurrences"`
+	Replaced    int    `json:"replaced"`
 	OldContent  string `json:"old_content"`
 	NewContent  string `json:"new_content"`
-	Status      string `json:"status"`
-	Occurrences int    `json:"occurrences,omitempty"`
 }
 
-func EditFile(filePath string, newContent string, oldContent string) (*EditResult, error) {
+func EditFile(filePath, oldContent, newContent string, replaceAll bool) (*EditResult, error) {
 	if oldContent == "" {
 		return nil, fmt.Errorf("old_content cannot be empty")
 	}
-	if newContent == "" {
-		return nil, fmt.Errorf("new_content cannot be empty")
+	if oldContent == newContent {
+		return nil, fmt.Errorf("old_content and new_content are identical")
 	}
 
-	// Ask user permission
-	desc := fmt.Sprintf("Target File: %s\n--- Old Content (%d chars) ---\n%s\n--- New Content (%d chars) ---\n%s",
-		filePath, len(oldContent), oldContent, len(newContent), newContent)
+	// Resolve symlink supaya rename tidak menimpa symlink-nya
+	realPath, err := filepath.EvalSymlinks(filePath)
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Stat(realPath)
+	if err != nil {
+		return nil, err
+	}
+	if info.IsDir() {
+		return nil, fmt.Errorf("%s is a directory", filePath)
+	}
+
+	data, err := os.ReadFile(realPath)
+	if err != nil {
+		return nil, err
+	}
+	raw := string(data)
+
+	// Validasi dulu sebelum minta permission
+	occurrences := strings.Count(raw, oldContent)
+	switch {
+	case occurrences == 0:
+		return nil, fmt.Errorf("old content not found in file")
+	case occurrences > 1 && !replaceAll:
+		return nil, fmt.Errorf("old content found %d times; add more surrounding context or set replace_all", occurrences)
+	}
+
+	n, replaced := 1, 1
+	if replaceAll {
+		n, replaced = -1, occurrences
+	}
+	updated := strings.Replace(raw, oldContent, newContent, n)
+
+	desc := fmt.Sprintf("Target File: %s (%d occurrence(s) will be replaced)\n--- Old Content (%d chars) ---\n%s\n--- New Content (%d chars) ---\n%s",
+		filePath, replaced, len(oldContent), oldContent, len(newContent), newContent)
 	if err := AskPermission("edit", desc); err != nil {
 		return nil, err
 	}
 
-	var readResult *ReadOutput
-	err := SuppressPermission(func() error {
-		var rerr error
-		readResult, rerr = ReadFile(filePath)
-		return rerr
-	})
-	if err != nil {
+	if err := writeFileAtomic(realPath, []byte(updated), info.Mode().Perm()); err != nil {
 		return nil, err
 	}
 
-	var rawContent string
-	for _, line := range readResult.Lines {
-		i := strings.Index(line, "] ")
-		if i == -1 {
-			return nil, fmt.Errorf("unexpected line format: %s", line)
+	return &EditResult{
+		Path:        filePath,
+		Status:      "success",
+		Occurrences: occurrences,
+		Replaced:    replaced,
+		OldContent:  oldContent,
+		NewContent:  newContent,
+	}, nil
+}
+
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-"+filepath.Base(path)+"-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		if tmpName != "" {
+			_ = os.Remove(tmpName)
 		}
-		line = line[i+2:] // Remove line number prefix
-		rawContent += line + "\n"
+	}()
+
+	_, werr := tmp.Write(data) // Write sudah return error kalau partial write
+	if werr == nil {
+		werr = tmp.Chmod(perm) // pertahankan permission asli
+	}
+	if werr == nil {
+		werr = tmp.Sync()
+	}
+	cerr := tmp.Close()
+	if werr != nil {
+		return werr
+	}
+	if cerr != nil {
+		return cerr
 	}
 
-	// 4. Count occurrences
-	occurrences := strings.Count(rawContent, oldContent)
-
-	if strings.Contains(rawContent, oldContent) {
-		// 5. Replace (only first occurrence)
-		updatedContent := strings.Replace(rawContent, oldContent, newContent, 1)
-
-		// 6. Verify content changed
-		if updatedContent == rawContent {
-			return nil, fmt.Errorf("content unchanged after replacement")
-		}
-
-		dir := filepath.Dir(filePath)
-
-		tmp, err := os.CreateTemp(dir, ".tmp-"+filepath.Base(filePath)+"-*")
-		if err != nil {
-			return nil, err
-		}
-		tmpName := tmp.Name()
-
-		// Clean up on any failure
-		defer func() {
-			if tmpName != "" {
-				_ = tmp.Close()
-				_ = os.Remove(tmpName)
-			}
-		}()
-
-		// ✅ 5. Write data + VERIFY bytes written
-		contentBytes := []byte(updatedContent)
-		bytesWritten, err := tmp.Write(contentBytes)
-		if err != nil {
-			return nil, err
-		}
-
-		// ✅ Verify semua bytes tertulis
-		if bytesWritten != len(contentBytes) {
-			return nil, fmt.Errorf("partial write: %d/%d bytes", bytesWritten, len(contentBytes))
-		}
-
-		// 3. fsync to ensure data hits disk before rename
-		if err := tmp.Sync(); err != nil {
-			return nil, err
-		}
-
-		// 3. Set permissions (0644 = rw-r--r--)
-		if err := tmp.Chmod(0644); err != nil {
-			return nil, err
-		}
-
-		if err := tmp.Close(); err != nil {
-			return nil, err
-		}
-
-		if err := os.Rename(tmpName, filePath); err != nil {
-			return nil, err
-		}
-		tmpName = ""
-
-		verifyData, err := os.ReadFile(filePath)
-		if err != nil {
-			return nil, err
-		}
-		if string(verifyData) != updatedContent {
-			// Data tidak match - ini serious error
-			os.Remove(filePath) // Clean up corrupted file
-			return nil, fmt.Errorf("data integrity check failed after write")
-		}
-		return &EditResult{Path: filePath, Status: "success", OldContent: oldContent, NewContent: newContent, Occurrences: occurrences}, nil
-	} else {
-		return nil, fmt.Errorf("old content not found in file")
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
 	}
+	tmpName = ""
+	return nil
+}
+
+// EditHandler adapts EditFile to server.ToolHandlerFunc.
+func EditHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	path, err := req.RequireString("file_path")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	oldContent, err := req.RequireString("old_content")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	newContent, err := req.RequireString("new_content")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	replaceAll := req.GetBool("replace_all", false)
+
+	res, err := EditFile(path, oldContent, newContent, replaceAll)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	b, _ := json.Marshal(res)
+	return mcp.NewToolResultText(string(b)), nil
 }
