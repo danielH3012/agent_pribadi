@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	toolPkg "agentPribadi/tools"
+	toolPkg "agentPribadi/mcp/tools"
 )
 
 type ToolCall struct {

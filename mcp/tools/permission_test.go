@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -112,15 +113,26 @@ func TestSuppressPermission(t *testing.T) {
 
 func TestToolBash_PermissionDenied(t *testing.T) {
 	CustomPermissionReader = strings.NewReader("n\n")
-	defer func() {
-		CustomPermissionReader = nil
-	}()
+	defer func() { CustomPermissionReader = nil }()
 
-	res, err := Bash("echo 'dangerous'")
+	res, err := Bash(context.Background(), "echo 'dangerous'")
 	if err == nil {
 		t.Fatalf("expected Bash to fail with permission denied, got result: %v", res)
 	}
 	if !strings.Contains(err.Error(), "permission denied") {
 		t.Errorf("expected permission error, got: %v", err)
+	}
+}
+
+func TestToolBash_PermissionGranted(t *testing.T) {
+	CustomPermissionReader = strings.NewReader("y\n")
+	defer func() { CustomPermissionReader = nil }()
+
+	res, err := Bash(context.Background(), "echo hello")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.Success || strings.TrimSpace(res.Stdout) != "hello" {
+		t.Errorf("unexpected result: %+v", res)
 	}
 }

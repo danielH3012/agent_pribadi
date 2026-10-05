@@ -208,18 +208,8 @@ func dispatchSubAgent(ctx context.Context, toolName string, argsJSON string) (st
 	}
 
 	switch toolName {
-	case "call_file_summarizer":
-		return FileSummerizer(ctx, params.Query, nil)
-	case "call_code_fixer":
-		return CodeFixer(ctx, params.Query, nil)
-	case "call_software_agent":
-		return SoftwareAgent(ctx, params.Query, nil)
-	case "call_testing_agent":
-		return TestingAgent(ctx, params.Query, nil)
-	case "call_reviewer_agent":
-		return ReviewerAgent(ctx, params.Query, nil)
-	case "call_documenter_agent":
-		return DocumenterAgent(ctx, params.Query, nil)
+	case "subAgent":
+		return subAgent(ctx, params.Query, nil)
 	default:
 		return "", fmt.Errorf("sub-agent tidak dikenal: %s", toolName)
 	}
