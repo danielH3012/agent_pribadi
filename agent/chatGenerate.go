@@ -114,6 +114,12 @@ func ChatGenerate(ctx context.Context, messages []Message, tools any, maxNewToke
 						ReasoningContent string `json:"reasoning_content"`
 						ReasoningDetails any    `json:"reasoning_details"`
 						Reasoning        any    `json:"reasoning"`
+						ToolCalls        []struct {
+							Function struct {
+								Name      string `json:"name"`
+								Arguments string `json:"arguments"`
+							} `json:"function"`
+						} `json:"tool_calls"`
 					} `json:"message"`
 				} `json:"choices"`
 				Usage struct {
@@ -131,16 +137,28 @@ func ChatGenerate(ctx context.Context, messages []Message, tools any, maxNewToke
 					var reasoning any
 
 					if len(res.Choices) > 0 {
-						rawOutput = res.Choices[0].Message.Content
-						if strings.TrimSpace(rawOutput) == "" && strings.TrimSpace(res.Choices[0].Message.ReasoningContent) != "" {
-							rawOutput = res.Choices[0].Message.ReasoningContent
+						choiceMsg := res.Choices[0].Message
+						rawOutput = choiceMsg.Content
+						if strings.TrimSpace(rawOutput) == "" && strings.TrimSpace(choiceMsg.ReasoningContent) != "" {
+							rawOutput = choiceMsg.ReasoningContent
 						}
-						reasoning = res.Choices[0].Message.ReasoningDetails
+						if len(choiceMsg.ToolCalls) > 0 {
+							var toolCallsBuilder strings.Builder
+							for _, tc := range choiceMsg.ToolCalls {
+								toolCallsBuilder.WriteString(fmt.Sprintf("<tool_call>\n{\"name\": %q, \"arguments\": %s}\n</tool_call>\n", tc.Function.Name, tc.Function.Arguments))
+							}
+							if strings.TrimSpace(rawOutput) != "" {
+								rawOutput = rawOutput + "\n" + toolCallsBuilder.String()
+							} else {
+								rawOutput = toolCallsBuilder.String()
+							}
+						}
+						reasoning = choiceMsg.ReasoningDetails
 						if reasoning == nil {
-							reasoning = res.Choices[0].Message.Reasoning
+							reasoning = choiceMsg.Reasoning
 						}
 						if reasoning == nil {
-							reasoning = res.Choices[0].Message.ReasoningContent
+							reasoning = choiceMsg.ReasoningContent
 						}
 					}
 

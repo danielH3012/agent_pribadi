@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"strings"
+
+	"agentPribadi/controller"
+	"agentPribadi/mcp"
 )
 
 func prompt(prompt string) string {
@@ -11,9 +14,16 @@ func prompt(prompt string) string {
 	return prompt
 }
 
-func subAgent(ctx context.Context, query string, tools []ToolDefinition) (string, error) {
+func subAgent(ctx context.Context, query string, tools []ToolDefinition, mcpServer *mcp.Server, agent_prompt string) (string, error) {
+	if mcpServer == nil {
+		mcpServer = mcp.DefaultServer()
+	}
 	if len(tools) == 0 {
-		tools = []ToolDefinition{GlobTool, GrepTool, ReadTool}
+		tools = GetAgentTools(mcpServer)
+	}
+
+	if strings.TrimSpace(agent_prompt) == "" {
+		agent_prompt = controller.NewSubAgent().Prompt
 	}
 
 	var toolGuide strings.Builder
@@ -22,8 +32,10 @@ func subAgent(ctx context.Context, query string, tools []ToolDefinition) (string
 	}
 
 	systemprompt := fmt.Sprintf(`
-		
 		%s
+
+		Available Tools Guide:
+%s
 
 		Execution Rules:
 			1. **Thinking (<thought>...</thought>)**: Analyze the user's intent and determine what data or tools are required.
@@ -42,7 +54,7 @@ func subAgent(ctx context.Context, query string, tools []ToolDefinition) (string
 				<tool_call>
 					{"name": "no_tools", "arguments": {"reason": "greeting or no tool required"}}
 				</tool_call>
-	`, prompt)
+	`, agent_prompt, toolGuide.String())
 	messages := []Message{
 		{
 			Role:    "system",
@@ -79,7 +91,7 @@ func subAgent(ctx context.Context, query string, tools []ToolDefinition) (string
 
 		messages = append(messages, Message{Role: "assistant", Content: res.RawOutput})
 
-		toolOutputs := ProcessToolCalls(validCalls)
+		toolOutputs := ProcessToolCalls(ctx, validCalls, mcpServer)
 
 		messages = append(messages, Message{
 			Role:    "user",
@@ -93,4 +105,28 @@ func subAgent(ctx context.Context, query string, tools []ToolDefinition) (string
 		return "", err
 	}
 	return strings.TrimSpace(finalRes.RawOutput), nil
+}
+
+// GenerateResponse generates the final response
+func alldone(ctx context.Context, query string, contextStr string, userContext map[string]any, model string) string {
+	if model == "" {
+		model = GeneratorModel
+	}
+
+	systemPrompt := "your job is to determine from the history of tool call in the context and the task is the task are completed or not, and if completed you will provide the final answer to the user, if not completed you will provide the next step to complete the task. You will only provide the final answer if the stages are completed."
+	
+	messages := []Message{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: query},
+	}
+
+	res, err := ChatGenerate(ctx, messages, nil, 32768, model, 3)
+	if err != nil {
+		return "I do not have information or unable to do that."
+	}
+	finalAns := res.RawOutput 
+	if finalAns == "" {
+		return "I do not have information or unable to do that."
+	}
+	return finalAns
 }

@@ -1,12 +1,84 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
 
-	toolPkg "agentPribadi/mcp/tools"
+	"agentPribadi/mcp"
 )
+
+// ToolDefinition represents a tool specification compatible with OpenAI/LLM function calling.
+type ToolDefinition struct {
+	Type     string       `json:"type"`
+	Function ToolFunction `json:"function"`
+}
+
+// ToolFunction describes a function and its expected JSON parameters.
+type ToolFunction struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Parameters  any    `json:"parameters,omitempty"`
+}
+
+// FunctionParams is the JSON Schema representation for function arguments.
+type FunctionParams struct {
+	Type                 string                    `json:"type"`
+	Properties           map[string]PropertySchema `json:"properties,omitempty"`
+	Required             []string                  `json:"required,omitempty"`
+	AdditionalProperties bool                      `json:"additionalProperties"`
+}
+
+// PropertySchema describes a single property schema inside parameters.
+type PropertySchema struct {
+	Type        string                    `json:"type"`
+	Description string                    `json:"description,omitempty"`
+	Items       *PropertySchema           `json:"items,omitempty"`
+	Properties  map[string]PropertySchema `json:"properties,omitempty"`
+	Required    []string                  `json:"required,omitempty"`
+}
+
+// GetAgentTools extracts and converts all tools registered in the unified MCP server
+// into OpenAI-compatible ToolDefinitions for LLM function calling.
+func GetAgentTools(mcpServer *mcp.Server) []ToolDefinition {
+	if mcpServer == nil {
+		mcpServer = mcp.DefaultServer()
+	}
+
+	var definitions []ToolDefinition
+	for _, st := range mcpServer.Tools() {
+		var params any
+		if len(st.Tool.RawInputSchema) > 0 {
+			var rawMap any
+			if err := json.Unmarshal(st.Tool.RawInputSchema, &rawMap); err == nil {
+				params = rawMap
+			} else {
+				params = st.Tool.RawInputSchema
+			}
+		} else {
+			params = st.Tool.InputSchema
+		}
+
+		definitions = append(definitions, ToolDefinition{
+			Type: "function",
+			Function: ToolFunction{
+				Name:        st.Tool.Name,
+				Description: st.Tool.Description,
+				Parameters:  params,
+			},
+		})
+	}
+	return definitions
+}
+
+// GetTools returns the default tool definitions from DefaultServer.
+func GetTools() []ToolDefinition {
+	return GetAgentTools(nil)
+}
+
+// Tools contains built-in tool definitions for backwards compatibility.
+var Tools = GetTools()
 
 type ToolCall struct {
 	ID        string         `json:"id,omitempty"`
@@ -15,122 +87,25 @@ type ToolCall struct {
 	RawArgs   string         `json:"raw_args,omitempty"`
 }
 
-// ExecuteTool mengeksekusi tool berdasarkan nama dan arguments berupa JSON string.
-// Memetakan panggilan langsung ke function terkait di package tools.
-func ExecuteTool(name string, argsJSON string) (any, error) {
-	switch name {
-	case "bash":
-		var params struct {
-			Command string `json:"command"`
-		}
-		if err := json.Unmarshal([]byte(argsJSON), &params); err != nil {
-			return nil, fmt.Errorf("invalid arguments for bash: %w", err)
-		}
-		return toolPkg.Bash(params.Command)
-
-	case "edit":
-		var params struct {
-			Path       string `json:"path"`
-			FilePath   string `json:"file_path"`
-			OldContent string `json:"old_content"`
-			NewContent string `json:"new_content"`
-		}
-		if err := json.Unmarshal([]byte(argsJSON), &params); err != nil {
-			return nil, fmt.Errorf("invalid arguments for edit: %w", err)
-		}
-		targetPath := params.Path
-		if targetPath == "" {
-			targetPath = params.FilePath
-		}
-		return toolPkg.EditFile(targetPath, params.NewContent, params.OldContent)
-
-	case "glob":
-		var params struct {
-			Pattern string `json:"pattern"`
-		}
-		if err := json.Unmarshal([]byte(argsJSON), &params); err != nil {
-			return nil, fmt.Errorf("invalid arguments for glob: %w", err)
-		}
-		return toolPkg.Glob(params.Pattern)
-
-	case "grep":
-		var params struct {
-			Pattern      string `json:"pattern"`
-			Path         string `json:"path"`
-			SearchPath   string `json:"search_path"`
-			ContextLines int    `json:"context_lines"`
-		}
-		if err := json.Unmarshal([]byte(argsJSON), &params); err != nil {
-			return nil, fmt.Errorf("invalid arguments for grep: %w", err)
-		}
-		targetPath := params.Path
-		if targetPath == "" {
-			targetPath = params.SearchPath
-		}
-		if params.ContextLines > 0 {
-			return toolPkg.GrepWithContext(params.Pattern, targetPath, params.ContextLines)
-		}
-		return toolPkg.Grep(params.Pattern, targetPath)
-
-	case "multi_edit", "multiEdit":
-		var params struct {
-			Operations []toolPkg.EditResult `json:"operations"`
-		}
-		if err := json.Unmarshal([]byte(argsJSON), &params); err != nil {
-			return nil, fmt.Errorf("invalid arguments for multi_edit: %w", err)
-		}
-		return toolPkg.MultiEdit(params.Operations)
-
-	case "read":
-		var params struct {
-			Path     string `json:"path"`
-			FilePath string `json:"file_path"`
-			Limit    int    `json:"limit"`
-		}
-		if err := json.Unmarshal([]byte(argsJSON), &params); err != nil {
-			return nil, fmt.Errorf("invalid arguments for read: %w", err)
-		}
-		targetPath := params.Path
-		if targetPath == "" {
-			targetPath = params.FilePath
-		}
-		if params.Limit > 0 {
-			return toolPkg.ReadFile(targetPath, params.Limit)
-		}
-		return toolPkg.ReadFile(targetPath)
-
-	case "write":
-		var params struct {
-			Path     string `json:"path"`
-			FilePath string `json:"file_path"`
-			Content  string `json:"content"`
-		}
-		if err := json.Unmarshal([]byte(argsJSON), &params); err != nil {
-			return nil, fmt.Errorf("invalid arguments for write: %w", err)
-		}
-		targetPath := params.Path
-		if targetPath == "" {
-			targetPath = params.FilePath
-		}
-		return toolPkg.WriteFile(targetPath, params.Content)
-
-	default:
-		return nil, fmt.Errorf("unknown tool: %s", name)
+// ExecuteTool mengeksekusi tool langsung melalui Unified MCP Server.
+func ExecuteTool(ctx context.Context, name string, argsJSON string, mcpServer *mcp.Server) (any, error) {
+	if mcpServer == nil {
+		mcpServer = mcp.DefaultServer()
 	}
+	return mcpServer.Call(ctx, name, json.RawMessage(argsJSON))
 }
 
-// ProcessToolCalls mengeksekusi daftar ToolCall dan mengembalikan string hasil untuk dikirim ke LLM.
-func ProcessToolCalls(calls []ToolCall) []string {
+// ProcessToolCalls mengeksekusi daftar ToolCall melalui Unified MCP Server dan mengembalikan output untuk LLM.
+func ProcessToolCalls(ctx context.Context, calls []ToolCall, mcpServer *mcp.Server) []string {
 	var outputs []string
 	for _, tc := range calls {
-
 		argsJSON := tc.RawArgs
 		if argsJSON == "" && tc.Arguments != nil {
 			b, _ := json.Marshal(tc.Arguments)
 			argsJSON = string(b)
 		}
 
-		result, err := ExecuteTool(tc.Name, argsJSON)
+		result, err := ExecuteTool(ctx, tc.Name, argsJSON, mcpServer)
 		if err != nil {
 			outputs = append(outputs, fmt.Sprintf("Tool %s error: %v", tc.Name, err))
 		} else {

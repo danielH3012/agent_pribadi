@@ -1,4 +1,4 @@
-package agent
+package controller
 
 import (
 	"encoding/json"
@@ -240,8 +240,46 @@ func NewMCPLink(opts ...RequestMCPOption) MCPLink {
 	return m
 }
 
-type subAgent struct {
-	description string
-	tools       []string
-	prompt      string
+type SubAgent struct {
+	Description string   `json:"description"`
+	Tools       []string `json:"tools,omitempty"`
+	Prompt      string   `json:"prompt"`
+}
+
+type RequestSubAgentOption func(*SubAgent)
+
+func WithSubAgentDescription(desc string) RequestSubAgentOption {
+	return func(s *SubAgent) {
+		if desc != "" {
+			s.Description = desc
+		}
+	}
+}
+
+func WithSubAgentTools(tools []string) RequestSubAgentOption {
+	return func(s *SubAgent) {
+		if len(tools) > 0 {
+			s.Tools = tools
+		}
+	}
+}
+
+func WithSubAgentPrompt(prompt string) RequestSubAgentOption {
+	return func(s *SubAgent) {
+		if prompt != "" {
+			s.Prompt = prompt
+		}
+	}
+}
+
+// NewSubAgent creates a SubAgent with default settings and applies any options.
+func NewSubAgent(opts ...RequestSubAgentOption) SubAgent {
+	s := SubAgent{
+		Description: "Sub-agent for executing specialized task instructions using available tools",
+		Prompt:      "You are an expert sub-agent. Analyze the task carefully and execute it using available tools.",
+	}
+	for _, opt := range opts {
+		opt(&s)
+	}
+	return s
 }
