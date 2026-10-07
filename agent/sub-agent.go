@@ -35,7 +35,7 @@ func subAgent(ctx context.Context, query string, tools []ToolDefinition, mcpServ
 		%s
 
 		Available Tools Guide:
-%s
+			%s
 
 		Execution Rules:
 			1. **Thinking (<thought>...</thought>)**: Analyze the user's intent and determine what data or tools are required.
